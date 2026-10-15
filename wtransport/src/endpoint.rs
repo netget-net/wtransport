@@ -303,14 +303,21 @@ impl Endpoint<endpoint_side::Client> {
 
         let driver = Driver::init(quic_connection.clone());
 
-        let _settings = driver.accept_settings().await.map_err(|driver_error| {
+        let settings = driver.accept_settings().await.map_err(|driver_error| {
             ConnectingError::ConnectionError(ConnectionError::with_driver_error(
                 driver_error,
                 &quic_connection,
             ))
         })?;
 
-        // TODO(biagio): validate settings
+        // Extended CONNECT is accepted only after the server opted in.
+        if settings.get(wtransport_proto::settings::SettingId::EnableConnectProtocol)
+            != Some(VarInt::from_u32(1))
+        {
+            return Err(ConnectingError::ConnectionError(
+                ConnectionError::local_h3_error(ErrorCode::Settings),
+            ));
+        }
 
         let mut session_request_proto =
             SessionRequestProto::new(url.as_ref()).expect("Url has been already validate");

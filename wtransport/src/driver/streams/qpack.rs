@@ -21,10 +21,6 @@ impl RemoteQPackEncStream {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.stream.is_none()
-    }
-
     pub fn set_stream(&mut self, stream: StreamUniRemoteH3) {
         assert!(matches!(stream.kind(), StreamKind::QPackEncoder));
         self.stream = Some(stream);
@@ -68,10 +64,6 @@ impl RemoteQPackDecStream {
             stream: None,
             buffer,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.stream.is_none()
     }
 
     pub fn set_stream(&mut self, stream: StreamUniRemoteH3) {

@@ -88,10 +88,6 @@ impl RemoteSettingsStream {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.stream.is_none()
-    }
-
     pub fn set_stream(&mut self, stream: StreamUniRemoteH3) {
         assert!(matches!(stream.kind(), StreamKind::Control));
         self.stream = Some(stream);

@@ -6,6 +6,7 @@ use crate::driver::streams::uniremote::StreamUniRemoteWT;
 use crate::driver::streams::Stream;
 use crate::driver::utils::bichannel;
 use crate::driver::utils::shared_result;
+use crate::driver::utils::varint_w2q;
 use crate::driver::utils::SendError;
 use crate::driver::utils::SharedResultGet;
 use crate::driver::utils::SharedResultSet;
@@ -43,6 +44,7 @@ pub struct Driver {
     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
     ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
     driver_result: SharedResultGet<DriverError>,
+    worker: tokio::task::JoinHandle<()>,
 }
 
 impl Driver {
@@ -54,7 +56,7 @@ impl Driver {
         let ready_datagrams = mpsc::channel(1);
         let driver_result = shared_result();
 
-        tokio::spawn(
+        let worker = tokio::spawn(
             worker::Worker::new(
                 quic_connection.clone(),
                 ready_settings.0,
@@ -76,6 +78,7 @@ impl Driver {
             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
             ready_datagrams: Mutex::new(ready_datagrams.1),
             driver_result: driver_result.1,
+            worker,
         }
     }
 
@@ -235,6 +238,15 @@ impl Driver {
     }
 }
 
+// The last session handle owns the driver and every stream/control reader beneath it.
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.quic_connection
+            .close(varint_w2q(ErrorCode::NoError.to_code()), b"");
+        self.worker.abort();
+    }
+}
+
 mod worker {
     use super::*;
     use crate::driver::streams::qpack::RemoteQPackDecStream;
@@ -266,6 +278,11 @@ mod worker {
         remote_qpack_enc_stream: RemoteQPackEncStream,
         remote_qpack_dec_stream: RemoteQPackDecStream,
         connect_stream: ConnectStream,
+        readers: tokio::task::JoinSet<Result<(), DriverError>>,
+        remote_settings_seen: bool,
+        remote_encoder_seen: bool,
+        remote_decoder_seen: bool,
+        session_registered: bool,
     }
 
     impl Worker {
@@ -291,6 +308,11 @@ mod worker {
                 remote_qpack_enc_stream: RemoteQPackEncStream::empty(),
                 remote_qpack_dec_stream: RemoteQPackDecStream::empty(),
                 connect_stream: ConnectStream::empty(),
+                readers: tokio::task::JoinSet::new(),
+                remote_settings_seen: false,
+                remote_encoder_seen: false,
+                remote_decoder_seen: false,
+                session_registered: false,
             }
         }
 
@@ -327,19 +349,25 @@ mod worker {
             let mut ready_bi_h3_streams = mpsc::channel(1);
 
             self.open_and_send_settings().await?;
+            let mut local_settings = std::mem::replace(
+                &mut self.local_settings_stream,
+                LocalSettingsStream::empty(),
+            );
+            self.readers
+                .spawn(async move { Err(local_settings.run().await) });
 
             loop {
                 tokio::select! {
                     result = Self::accept_uni(&self.quic_connection,
                                               &ready_uni_h3_streams.0,
-                                              &self.ready_uni_wt_streams) => {
-                        result?;
+                                              &self.ready_uni_wt_streams), if self.readers.len() < 16 => {
+                        self.readers.spawn(result?);
                     }
 
                     result = Self::accept_bi(&self.quic_connection,
                                              &ready_bi_h3_streams.0,
-                                             &self.ready_bi_wt_streams) => {
-                        result?;
+                                             &self.ready_bi_wt_streams), if self.readers.len() < 16 => {
+                        self.readers.spawn(result?);
                     }
 
                     result = Self::accept_datagram(&self.quic_connection,
@@ -359,27 +387,30 @@ mod worker {
 
 
                     settings = remote_settings_watcher.accept_settings() => {
-                        let settings = settings.expect("Channel cannot be dropped");
+                        let settings = settings.ok_or(DriverError::NotConnected)?;
                         self.handle_remote_settings(settings)?;
                     }
 
                     stream_session = self.ready_sessions.recv() => {
                         match stream_session {
                             Some(stream_session) => {
-                                if self.connect_stream.is_empty() {
+                                if !self.session_registered {
+                                    self.session_registered = true;
                                     self.connect_stream.set_stream(stream_session);
+                                    let mut connect = std::mem::replace(&mut self.connect_stream, ConnectStream::empty());
+                                    self.readers.spawn(async move { Err(connect.run().await) });
                                 }
                             }
                             None => return Err(DriverError::NotConnected),
                         };
                     }
 
-                    error = Self::run_control_streams(&mut self.local_settings_stream,
-                                                      &mut self.remote_settings_stream,
-                                                      &mut self.remote_qpack_enc_stream,
-                                                      &mut self.remote_qpack_dec_stream,
-                                                      &mut self.connect_stream) => {
-                        return Err(error);
+                    result = self.readers.join_next(), if !self.readers.is_empty() => {
+                        match result {
+                            Some(Ok(Ok(()))) => {},
+                            Some(Ok(Err(error))) => return Err(error),
+                            Some(Err(_)) | None => return Err(DriverError::Proto(ErrorCode::Internal)),
+                        }
                     }
 
                     () = self.driver_result.closed() => {
@@ -413,7 +444,10 @@ mod worker {
             quic_connection: &quinn::Connection,
             ready_uni_h3_streams: &mpsc::Sender<Result<StreamUniRemoteH3, DriverError>>,
             ready_uni_wt_streams: &mpsc::Sender<StreamUniRemoteWT>,
-        ) -> Result<(), DriverError> {
+        ) -> Result<
+            impl std::future::Future<Output = Result<(), DriverError>> + Send + 'static,
+            DriverError,
+        > {
             trace!("H3 uni queue capacity: {}", ready_uni_h3_streams.capacity());
             let h3_slot = ready_uni_h3_streams
                 .clone()
@@ -433,8 +467,8 @@ mod worker {
             let stream_id = stream_quic.id();
             debug!("New incoming uni stream ({})", stream_id);
 
-            tokio::spawn(
-                async move {
+            Ok(async move {
+                let parse = async move {
                     let stream_h3 = match stream_quic.upgrade().await {
                         Ok(stream_h3) => stream_h3,
                         Err(ProtoReadError::H3(error_code)) => {
@@ -455,11 +489,13 @@ mod worker {
                     } else {
                         h3_slot.send(Ok(stream_h3));
                     }
-                }
-                .instrument(debug_span!("Stream", "id={}", stream_id)),
-            );
-
-            Ok(())
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(10), parse)
+                    .await
+                    .map_err(|_| DriverError::Proto(ErrorCode::ExcessiveLoad))?;
+                Ok(())
+            }
+            .instrument(debug_span!("Stream", "id={}", stream_id)))
         }
 
         async fn accept_bi(
@@ -468,7 +504,10 @@ mod worker {
                 Result<(StreamBiRemoteH3, Frame<'static>), DriverError>,
             >,
             ready_bi_wt_streams: &mpsc::Sender<StreamBiRemoteWT>,
-        ) -> Result<(), DriverError> {
+        ) -> Result<
+            impl std::future::Future<Output = Result<(), DriverError>> + Send + 'static,
+            DriverError,
+        > {
             trace!("H3 bi queue capacity: {}", ready_bi_h3_streams.capacity());
             let h3_slot = ready_bi_h3_streams
                 .clone()
@@ -488,8 +527,8 @@ mod worker {
             let stream_id = stream_quic.id();
             debug!("New incoming bi stream ({})", stream_id);
 
-            tokio::spawn(
-                async move {
+            Ok(async move {
+                let parse = async move {
                     let mut stream_h3 = stream_quic.upgrade();
 
                     let frame = loop {
@@ -521,11 +560,13 @@ mod worker {
                             h3_slot.send(Ok((stream_h3, frame)));
                         }
                     }
-                }
-                .instrument(debug_span!("Stream", "id={}", stream_id)),
-            );
-
-            Ok(())
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(10), parse)
+                    .await
+                    .map_err(|_| DriverError::Proto(ErrorCode::ExcessiveLoad))?;
+                Ok(())
+            }
+            .instrument(debug_span!("Stream", "id={}", stream_id)))
         }
 
         async fn accept_datagram(
@@ -560,25 +601,43 @@ mod worker {
         fn handle_uni_h3_stream(&mut self, stream: StreamUniRemoteH3) -> Result<(), DriverError> {
             match stream.kind() {
                 StreamKind::Control => {
-                    if !self.remote_settings_stream.is_empty() {
+                    if self.remote_settings_seen {
                         return Err(DriverError::Proto(ErrorCode::StreamCreation));
                     }
 
+                    self.remote_settings_seen = true;
                     self.remote_settings_stream.set_stream(stream);
+                    let mut reader = std::mem::replace(
+                        &mut self.remote_settings_stream,
+                        RemoteSettingsStream::empty(),
+                    );
+                    self.readers.spawn(async move { Err(reader.run().await) });
                 }
                 StreamKind::QPackEncoder => {
-                    if !self.remote_qpack_enc_stream.is_empty() {
+                    if self.remote_encoder_seen {
                         return Err(DriverError::Proto(ErrorCode::StreamCreation));
                     }
 
+                    self.remote_encoder_seen = true;
                     self.remote_qpack_enc_stream.set_stream(stream);
+                    let mut reader = std::mem::replace(
+                        &mut self.remote_qpack_enc_stream,
+                        RemoteQPackEncStream::empty(),
+                    );
+                    self.readers.spawn(async move { Err(reader.run().await) });
                 }
                 StreamKind::QPackDecoder => {
-                    if !self.remote_qpack_dec_stream.is_empty() {
+                    if self.remote_decoder_seen {
                         return Err(DriverError::Proto(ErrorCode::StreamCreation));
                     }
 
+                    self.remote_decoder_seen = true;
                     self.remote_qpack_dec_stream.set_stream(stream);
+                    let mut reader = std::mem::replace(
+                        &mut self.remote_qpack_dec_stream,
+                        RemoteQPackDecStream::empty(),
+                    );
+                    self.readers.spawn(async move { Err(reader.run().await) });
                 }
                 StreamKind::WebTransport => unreachable!(),
                 StreamKind::Exercise(_) => {}
@@ -643,25 +702,19 @@ mod worker {
             Ok(())
         }
 
-        async fn run_control_streams(
-            local_settings: &mut LocalSettingsStream,
-            remote_settings: &mut RemoteSettingsStream,
-            remote_qpack_enc: &mut RemoteQPackEncStream,
-            remote_qpack_dec: &mut RemoteQPackDecStream,
-            connect_stream: &mut ConnectStream,
-        ) -> DriverError {
-            tokio::select! {
-                error = connect_stream.run() => error,
-                error = local_settings.run() => error,
-                error = remote_settings.run() => error,
-                error = remote_qpack_enc.run() => error,
-                error = remote_qpack_dec.run() => error,
-            }
-        }
-
         fn handle_remote_settings(&mut self, settings: Settings) -> Result<(), DriverError> {
             debug!("Received: {:?}", settings);
-
+            use wtransport_proto::settings::SettingId;
+            let value = |id| settings.get(id).map(|v| v.into_inner()).unwrap_or(0);
+            if value(SettingId::H3Datagram) != 1
+                || self.quic_connection.max_datagram_size().is_none()
+                || (value(SettingId::EnableWebTransport) != 1
+                    && value(SettingId::WebTransportMaxSessions) == 0)
+                || value(SettingId::EnableConnectProtocol) > 1
+                || value(SettingId::EnableWebTransport) > 1
+            {
+                return Err(DriverError::Proto(ErrorCode::Settings));
+            }
             match self.ready_settings.try_send(settings) {
                 Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(DriverError::NotConnected),

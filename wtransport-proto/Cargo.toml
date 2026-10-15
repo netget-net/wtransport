@@ -1,10 +1,10 @@
 [package]
-name = "wtransport-proto"
+name = "netget-wtransport-proto"
 version = "0.7.2"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
-description = "Implementation of the WebTransport (over HTTP3) protocol"
-repository = "https://github.com/BiagioFesta/wtransport"
+description = "NetGet fork of wtransport-proto: bounded QPACK field sections and checked SETTINGS. Implementation of the WebTransport (over HTTP3) protocol"
+repository = "https://github.com/netget-net/wtransport"
 keywords = ["webtransport"]
 categories = [ "network-programming", "asynchronous" ]
 edition = "2021"
@@ -32,3 +32,6 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "wtransport_proto"

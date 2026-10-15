@@ -115,13 +115,15 @@ impl Settings {
         assert!(matches!(frame.kind(), FrameKind::Settings));
 
         let mut settings = Settings::new();
+        let mut seen_ids = std::collections::HashSet::new();
         let mut buffer_reader = BufferReader::new(frame.payload());
 
         while buffer_reader.capacity() > 0 {
             let id = buffer_reader.get_varint().ok_or(ErrorCode::Frame)?;
             let value = buffer_reader.get_varint().ok_or(ErrorCode::Frame)?;
-
-            // TODO(bfesta): do we need to validate value?
+            if !seen_ids.insert(id.into_inner()) {
+                return Err(ErrorCode::Settings);
+            }
 
             match SettingId::parse(id) {
                 Ok(setting_id) => match settings.0.entry(setting_id) {

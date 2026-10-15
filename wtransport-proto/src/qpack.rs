@@ -42,6 +42,18 @@ pub enum DecodingError {
     /// Index is out-of-bound in the static table.
     #[error("index not found in the static table")]
     IndexNotfound,
+
+    /// Decoded field section exceeds the selected bounded profile.
+    #[error("field section exceeds limit")]
+    FieldSectionTooLarge,
+
+    /// Duplicate fields cannot be represented by the single-value header map.
+    #[error("duplicate header field")]
+    DuplicateField,
+
+    /// Invalid HTTP/3 field syntax or pseudo-header ordering.
+    #[error("invalid header field")]
+    InvalidField,
 }
 
 enum FieldLineType {
@@ -69,10 +81,14 @@ impl Decoder {
     {
         let mut buffer_reader = BufferReader::new(data.as_ref());
 
-        Self::decode_integer::<8, _>(&mut buffer_reader)?;
-        Self::decode_integer::<7, _>(&mut buffer_reader)?;
+        if Self::decode_integer::<8, _>(&mut buffer_reader)?.1 != 0
+            || Self::decode_integer::<7, _>(&mut buffer_reader)? != (0, 0)
+        {
+            return Err(DecodingError::DynamicNotSupported);
+        }
 
         let mut headers = HashMap::new();
+        let mut decoded_bytes = 0usize;
 
         while buffer_reader.capacity() > 0 {
             let field = buffer_reader.buffer_remaining()[0];
@@ -87,7 +103,12 @@ impl Decoder {
                     let index = Self::decode_integer::<6, _>(&mut buffer_reader)?.1;
                     let (key, value) =
                         StaticTable::lookup_field(index).ok_or(DecodingError::IndexNotfound)?;
-                    headers.insert(key.to_string(), value.to_string());
+                    Self::insert(
+                        &mut headers,
+                        &mut decoded_bytes,
+                        key.to_string(),
+                        value.to_string(),
+                    )?;
                 }
                 FieldLineType::IndexedPost => {
                     return Err(DecodingError::DynamicNotSupported);
@@ -104,7 +125,7 @@ impl Decoder {
                         .0;
                     let value = Self::decode_string::<7, _>(&mut buffer_reader)?;
 
-                    headers.insert(key.to_string(), value);
+                    Self::insert(&mut headers, &mut decoded_bytes, key.to_string(), value)?;
                 }
                 FieldLineType::LiteralPostRefName => {
                     return Err(DecodingError::DynamicNotSupported);
@@ -113,12 +134,42 @@ impl Decoder {
                     let key = Self::decode_string::<3, _>(&mut buffer_reader)?;
                     let value = Self::decode_string::<7, _>(&mut buffer_reader)?;
 
-                    headers.insert(key, value);
+                    Self::insert(&mut headers, &mut decoded_bytes, key, value)?;
                 }
             }
         }
 
         Ok(headers)
+    }
+
+    fn insert(
+        headers: &mut HashMap<String, String>,
+        decoded_bytes: &mut usize,
+        key: String,
+        value: String,
+    ) -> Result<(), DecodingError> {
+        const MAX_FIELDS: usize = 64;
+        const MAX_FIELD_SECTION: usize = 16 * 1024;
+        let token = key.strip_prefix(':').unwrap_or(&key);
+        if token.is_empty()
+            || !token.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
+            })
+            || value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+            || (key.starts_with(':') && headers.keys().any(|name| !name.starts_with(':')))
+        {
+            return Err(DecodingError::InvalidField);
+        }
+        let size = key.len().saturating_add(value.len()).saturating_add(32);
+        if headers.len() >= MAX_FIELDS || size > MAX_FIELD_SECTION.saturating_sub(*decoded_bytes) {
+            return Err(DecodingError::FieldSectionTooLarge);
+        }
+        if headers.contains_key(&key) {
+            return Err(DecodingError::DuplicateField);
+        }
+        *decoded_bytes += size;
+        headers.insert(key, value);
+        Ok(())
     }
 
     fn decode_field_line_type(byte: u8) -> FieldLineType {
@@ -168,6 +219,10 @@ impl Decoder {
             let byte = bytes_reader
                 .get_bytes(1)
                 .ok_or(DecodingError::UnexpectedFin)?[0] as usize;
+
+            if power >= usize::BITS as usize || (byte & 0x7f) > (usize::MAX >> power) {
+                return Err(DecodingError::IntegerOverflow);
+            }
 
             value = value
                 .checked_add((byte & 0x7F) << power)

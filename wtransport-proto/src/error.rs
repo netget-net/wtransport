@@ -12,6 +12,9 @@ pub enum ErrorCode {
     /// `H3_NO_ERROR`.
     NoError,
 
+    /// `H3_INTERNAL_ERROR`.
+    Internal,
+
     /// `H3_STREAM_CREATION_ERROR`.
     StreamCreation,
 
@@ -58,6 +61,7 @@ impl ErrorCode {
         match self {
             ErrorCode::Datagram => h3_error_codes::H3_DATAGRAM_ERROR,
             ErrorCode::NoError => h3_error_codes::H3_NO_ERROR,
+            ErrorCode::Internal => VarInt::from_u32(0x0102),
             ErrorCode::StreamCreation => h3_error_codes::H3_STREAM_CREATION_ERROR,
             ErrorCode::ClosedCriticalStream => h3_error_codes::H3_CLOSED_CRITICAL_STREAM,
             ErrorCode::FrameUnexpected => h3_error_codes::H3_FRAME_UNEXPECTED,
@@ -88,6 +92,7 @@ impl Display for ErrorCode {
         match self {
             ErrorCode::Datagram => write!(f, "DatagramError"),
             ErrorCode::NoError => write!(f, "NoError"),
+            ErrorCode::Internal => write!(f, "InternalError"),
             ErrorCode::StreamCreation => write!(f, "StreamCreationError"),
             ErrorCode::ClosedCriticalStream => write!(f, "ClosedCriticalStreamError"),
             ErrorCode::FrameUnexpected => write!(f, "FrameUnexpectedError"),
